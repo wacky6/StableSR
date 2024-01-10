@@ -26,6 +26,7 @@ import PIL
 import numpy as np
 import copy
 import torch
+from glob import glob
 from omegaconf import OmegaConf
 from PIL import Image
 from itertools import islice
@@ -34,6 +35,7 @@ from torch import autocast
 from sane_utils import seed_everything
 import torch.nn.functional as F
 from scripts.util_image import ImageSpliterTh
+import threading
 
 from ldm.util import instantiate_from_config
 from scripts.wavelet_color_fix import (
@@ -47,7 +49,11 @@ from cog import BasePredictor, Input, Path
 UNET_CONFIG = "configs/stableSRNew/v2-finetune_text_T_768v.yaml"
 UNET_CHECKPOINT = "checkpoints/stablesr_768v_000139.ckpt"
 VQGAN_CHECKPOINT = "checkpoints/vqgan_cfw_00011.ckpt"
-TILE_SIZE = 768
+TILE_SIZE = 768    # Model's native size is preferred?
+
+# WARN: VRAM intensive
+VQGAN_SIZE = 1536     # Size to VRAM: 1024 -> 15GB ; 1536 -> 19GB; 1736 -> 21G; 2048 -> 24G;
+VQGAN_STRIDE = 1472   # VQGAN - 64
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
@@ -168,7 +174,7 @@ class Predictor(BasePredictor):
                     else:
                         init_template = init_image
 
-                    im_spliter = ImageSpliterTh(cur_image, TILE_SIZE, TILE_SIZE, sf=1)
+                    im_spliter = ImageSpliterTh(cur_image, VQGAN_SIZE, VQGAN_STRIDE, sf=1)
                     pbar = real_tqdm(total=len(im_spliter))
                     pbar.set_description(pbar_tooltip)
                     for im_lq_pch, index_infos in im_spliter:
@@ -188,8 +194,8 @@ class Predictor(BasePredictor):
                             noise=noise,
                         )
                         samples = self.model.sample_canvas(
-                            cond=semantic_c, 
-                            struct_cond=init_latent, 
+                            cond=semantic_c,
+                            struct_cond=init_latent,
                             batch_size=im_lq_pch.size(0),
                             timesteps=steps,
                             time_replace=steps,
@@ -285,37 +291,46 @@ if __name__ == '__main__':
     p = Predictor()
     p.setup()
 
-    ref_img_path = "/argo/sts/sr-in/ref.png"
-    ref_img = Image.open(ref_img_path).convert("RGB")
-    w, h = ref_img.size
+    images = sorted(glob("/argo/sts/sr-in/references/*"))
+    images = filter(lambda p: os.path.splitext(p)[1].lower() in [".jpg", ".png"], images)
 
-    for prescale in [1, 4]:
-        image = ref_img.resize((w//prescale, h//prescale), resample=PIL.Image.LANCZOS)
-        image = np.array(image).astype(np.float32)
-        image = image / 255.0 * 2.0 - 1.0
-        image = image.transpose(2, 0, 1)
-        image = torch.from_numpy(image[None])
+    for ref_img_path in images:
+        basename, _ = os.path.splitext(os.path.basename(ref_img_path))
+        ref_img = Image.open(ref_img_path).convert("RGB")
+        w, h = ref_img.size
 
-        for seed in [42, 174, 0xaeae]:
-            for fidelity in [0, 0.25, 0.5, 0.75, 1]:
-                for steps in [10, 20, 40, 80, 160, 240]:
-                    key = f"scale{prescale}_seed{seed}_steps{steps}_fidelity{fidelity}"
+        for prescale in [1,2,4]:
+            image = ref_img.resize((w//prescale, h//prescale), resample=PIL.Image.LANCZOS)
+            image = np.array(image).astype(np.float32)
+            image = image / 255.0 * 2.0 - 1.0
+            image = image.transpose(2, 0, 1)
+            image = torch.from_numpy(image[None])
 
-                    output_image = p.predict(
-                        image,
-                        ddpm_steps = steps,
-                        fidelity_weight = fidelity,
-                        upscale = 4.0,
-                        seed = seed,
-                        tile_overlap = 32,
-                        colorfix_type = None,
-                        pbar_tooltip = key
-                    )
+            for seed in [42, 174, 0xAEAE]:
+                for fidelity in [0, 0.25, 0.5, 0.75, 1]:
+                    for steps in [10, 20, 40, 80, 160, 240]:
+                        key = f"{basename}__scale{prescale}_seed{seed}_steps{steps}_fidelity{fidelity}"
 
-                    output_image = torch.clamp((output_image + 1.0) / 2.0 * 255.0, min=0.0, max=255.0)
-                    output_image = output_image[0].cpu().numpy().transpose(1, 2, 0)
-                    
-                    save_path = f"/argo/sts/sr-out/references/{key}.png"
-                    Image.fromarray(output_image.astype(np.uint8)).save(save_path)
+                        output_image = p.predict(
+                            image,
+                            ddpm_steps = steps,
+                            fidelity_weight = fidelity,
+                            upscale = 4.0,
+                            seed = seed,
+                            tile_overlap = 32,
+                            colorfix_type = None,
+                            pbar_tooltip = key
+                        )
 
-            
+                        output_image = torch.clamp((output_image + 1.0) / 2.0 * 255.0, min=0.0, max=255.0)
+                        output_image = output_image[0].cpu().numpy().transpose(1, 2, 0)
+
+                        # Write image in the background.
+                        save_path = f"/argo/sts/sr-out/references/{key}.png"
+                        def write_image(path, numpyImgUint8):
+                            Image.fromarray(numpyImgUint8).save(path)
+                        threading.Thread(
+                            target=write_image,
+                            args=(save_path, output_image.astype(np.uint8)),
+                        ).start()
+
