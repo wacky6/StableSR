@@ -1,5 +1,21 @@
-# Prediction interface for Cog ⚙️
-# https://github.com/replicate/cog/blob/main/docs/python.md
+# The default TQDM usage in the following packages are offensive, mute all of them.
+# Unless it knows about casting magic.
+import tqdm
+TQDM_MAGIC = 0xAE
+class _TQDM(tqdm.tqdm):
+    def __init__(self, *argv, **kwargs):
+        kwargs['disable'] = True
+        if kwargs.get('magic', None) == TQDM_MAGIC:
+            kwargs['disable'] = False
+        kwargs.pop('magic', None)
+        super().__init__(*argv, **kwargs)
+def real_tqdm(*arg, **kwargs):
+    kwargs["magic"] = TQDM_MAGIC
+    kwargs["ascii"] = True
+    if "desc" in kwargs:
+        kwargs["desc"] = kwargs["desc"].rjust(12)
+    return tqdm.tqdm(*arg, **kwargs)
+tqdm.tqdm = _TQDM
 
 import os
 import PIL
@@ -8,12 +24,12 @@ import copy
 import torch
 from omegaconf import OmegaConf
 from PIL import Image
-from tqdm import trange
 from itertools import islice
 from einops import rearrange, repeat
 from torch import autocast
-from pytorch_lightning import seed_everything
+from sane_utils import seed_everything
 import torch.nn.functional as F
+from scripts.util_image import ImageSpliterTh
 
 from ldm.util import instantiate_from_config
 from scripts.wavelet_color_fix import (
@@ -23,12 +39,17 @@ from scripts.wavelet_color_fix import (
 
 from cog import BasePredictor, Input, Path
 
+# CONFIG
+UNET_CONFIG = "configs/stableSRNew/v2-finetune_text_T_768v.yaml"
+UNET_CHECKPOINT = "checkpoints/stablesr_768v_000139.ckpt"
+VQGAN_CHECKPOINT = "checkpoints/vqgan_cfw_00011.ckpt"
+TILE_SIZE = 768
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
-        config = OmegaConf.load("configs/stableSRNew/v2-finetune_text_T_512.yaml")
-        self.model = load_model_from_config(config, "stablesr_000117.ckpt")
+        config = OmegaConf.load(UNET_CONFIG)
+        self.model = load_model_from_config(config, UNET_CHECKPOINT)
         device = torch.device("cuda")
 
         self.model.configs = config
@@ -37,12 +58,13 @@ class Predictor(BasePredictor):
         vqgan_config = OmegaConf.load(
             "configs/autoencoder/autoencoder_kl_64x64x4_resi.yaml"
         )
-        self.vq_model = load_model_from_config(vqgan_config, "vqgan_cfw_00011.ckpt")
+        self.vq_model = load_model_from_config(vqgan_config, VQGAN_CHECKPOINT)
         self.vq_model = self.vq_model.to(device)
 
+    # `input_image` and `output_image` are fp32 nchw within range [-1, 1]
     def predict(
         self,
-        input_image: Path = Input(description="Input image"),
+        input_image: torch.Tensor,
         ddpm_steps: int = Input(
             description="Number of DDPM steps for sampling", default=200
         ),
@@ -66,11 +88,11 @@ class Predictor(BasePredictor):
         seed: int = Input(
             description="Random seed. Leave blank to randomize the seed", default=None
         ),
-    ) -> Path:
+        pbar_tooltip: str = '',
+    ) -> torch.Tensor:
         """Run a single prediction on the model"""
         if seed is None:
             seed = int.from_bytes(os.urandom(2), "big")
-        print(f"Using seed: {seed}")
 
         self.vq_model.decoder.fusion_w = fidelity_weight
 
@@ -79,7 +101,7 @@ class Predictor(BasePredictor):
         n_samples = 1
         device = torch.device("cuda")
 
-        cur_image = load_img(str(input_image)).to(device)
+        cur_image = image.to(device)
         cur_image = F.interpolate(
             cur_image,
             size=(int(cur_image.size(-2) * upscale), int(cur_image.size(-1) * upscale)),
@@ -120,9 +142,6 @@ class Predictor(BasePredictor):
         self.model = self.model.to(device)
 
         precision_scope = autocast
-        input_size = 512
-
-        output = "/tmp/out.png"
 
         with torch.no_grad():
             with precision_scope("cuda"):
@@ -131,15 +150,13 @@ class Predictor(BasePredictor):
                     init_image = init_image.clamp(-1.0, 1.0)
                     ori_size = None
 
-                    print(init_image.size())
-
                     if (
-                        init_image.size(-1) < input_size
-                        or init_image.size(-2) < input_size
+                        init_image.size(-1) < TILE_SIZE
+                        or init_image.size(-2) < TILE_SIZE
                     ):
                         ori_size = init_image.size()
-                        new_h = max(ori_size[-2], input_size)
-                        new_w = max(ori_size[-1], input_size)
+                        new_h = max(ori_size[-2], TILE_SIZE)
+                        new_w = max(ori_size[-1], TILE_SIZE)
                         init_template = torch.zeros(
                             1, init_image.size(1), new_h, new_w
                         ).to(init_image.device)
@@ -147,56 +164,48 @@ class Predictor(BasePredictor):
                     else:
                         init_template = init_image
 
-                    init_latent = self.model.get_first_stage_encoding(
-                        self.model.encode_first_stage(init_template)
-                    )  # move to latent space
-                    text_init = [""] * n_samples
-                    semantic_c = self.model.cond_stage_model(text_init)
-
-                    noise = torch.randn_like(init_latent)
-                    # If you would like to start from the intermediate steps, you can add noise to LR to the specific steps.
-                    t = repeat(torch.tensor([999]), "1 -> b", b=init_image.size(0))
-                    t = t.to(device).long()
-                    x_T = self.model.q_sample_respace(
-                        x_start=init_latent,
-                        t=t,
-                        sqrt_alphas_cumprod=sqrt_alphas_cumprod,
-                        sqrt_one_minus_alphas_cumprod=sqrt_one_minus_alphas_cumprod,
-                        noise=noise,
-                    )
-                    samples, _ = self.model.sample_canvas(
-                        cond=semantic_c,
-                        struct_cond=init_latent,
-                        batch_size=init_image.size(0),
-                        timesteps=ddpm_steps,
-                        time_replace=ddpm_steps,
-                        x_T=x_T,
-                        return_intermediates=True,
-                        tile_size=int(input_size / 8),
-                        tile_overlap=tile_overlap,
-                        batch_size_sample=n_samples,
-                    )
-                    _, enc_fea_lq = self.vq_model.encode(init_template)
-                    x_samples = self.vq_model.decode(
-                        samples * 1.0 / self.model.scale_factor, enc_fea_lq
-                    )
-                    if ori_size is not None:
-                        x_samples = x_samples[:, :, : ori_size[-2], : ori_size[-1]]
-                    if colorfix_type == "adain":
-                        x_samples = adaptive_instance_normalization(
-                            x_samples, init_image
+                    im_spliter = ImageSpliterTh(cur_image, TILE_SIZE, TILE_SIZE, sf=1)
+                    pbar = real_tqdm(total=len(im_spliter))
+                    pbar.set_description(pbar_tooltip)
+                    for im_lq_pch, index_infos in im_spliter:
+                        seed_everything(seed)
+                        init_latent = self.model.get_first_stage_encoding(self.model.encode_first_stage(im_lq_pch))  # move to latent space
+                        text_init = [''] * cur_image.size(0)
+                        semantic_c = self.model.cond_stage_model(text_init)
+                        noise = torch.randn_like(init_latent)
+                        # If you would like to start from the intermediate steps, you can add noise to LR to the specific steps.
+                        t = repeat(torch.tensor([999]), '1 -> b', b=cur_image.size(0))
+                        t = t.to(device).long()
+                        x_T = self.model.q_sample_respace(
+                            x_start=init_latent,
+                            t=t,
+                            sqrt_alphas_cumprod=sqrt_alphas_cumprod,
+                            sqrt_one_minus_alphas_cumprod=sqrt_one_minus_alphas_cumprod,
+                            noise=noise,
                         )
-                    elif colorfix_type == "wavelet":
-                        x_samples = wavelet_reconstruction(x_samples, init_image)
-                    x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
-
-                    for i in range(init_image.size(0)):
-                        x_sample = 255.0 * rearrange(
-                            x_samples[i].cpu().numpy(), "c h w -> h w c"
+                        samples, _ = self.model.sample_canvas(
+                            cond=semantic_c, 
+                            struct_cond=init_latent, 
+                            batch_size=im_lq_pch.size(0),
+                            timesteps=steps,
+                            time_replace=steps,
+                            x_T=x_T, return_intermediates=True,
+                            tile_size=int(TILE_SIZE/8),
+                            tile_overlap=tile_overlap,
+                            batch_size_sample=1,
                         )
-                        Image.fromarray(x_sample.astype(np.uint8)).save(output)
+                        _, enc_fea_lq = self.vq_model.encode(im_lq_pch)
+                        x_samples = self.vq_model.decode(samples * 1. / self.model.scale_factor, enc_fea_lq)
+                        if colorfix_type == 'adain':
+                            x_samples = adaptive_instance_normalization(x_samples, im_lq_pch)
+                        elif colorfix_type == 'wavelet':
+                            x_samples = wavelet_reconstruction(x_samples, im_lq_pch)
+                        im_spliter.update(x_samples, index_infos)
+                        pbar.update()
 
-        return Path(output)
+                    im_sr = im_spliter.gather()
+
+                    return torch.clamp(im_sr, min=-1.0, max=1.0)
 
 
 def load_model_from_config(config, ckpt, verbose=False):
@@ -268,13 +277,41 @@ def chunk(it, size):
     return iter(lambda: tuple(islice(it, size)), ())
 
 
-def load_img(path):
-    image = Image.open(path).convert("RGB")
-    w, h = image.size
-    print(f"loaded input image of size ({w}, {h}) from {path}")
-    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
-    image = image.resize((w, h), resample=PIL.Image.LANCZOS)
-    image = np.array(image).astype(np.float32) / 255.0
-    image = image[None].transpose(0, 3, 1, 2)
-    image = torch.from_numpy(image)
-    return 2.0 * image - 1.0
+if __name__ == '__main__':
+    p = Predictor()
+    p.setup()
+
+    ref_img_path = "/argo/sts/sr-in/ref.png"
+    ref_img = Image.open(ref_img_path).convert("RGB")
+    w, h = ref_img.size
+
+    for prescale in [1, 4]:
+        image = ref_img.resize((w//prescale, h//prescale), resample=PIL.Image.LANCZOS)
+        image = np.array(image).astype(np.float32) / 255.0
+        image = image.transpose(2, 0, 1)
+        image = torch.from_numpy(image[None])
+
+        for seed in [42, 174, 0xaeae]:
+            for fidelity in [0, 0.25, 0.5, 0.75, 1]:
+                for steps in [10, 20, 40, 80, 160, 240]:
+                    key = f"scale{prescale}_seed{seed}_steps{steps}_fidelity{fidelity}"
+
+                    output_image = p.predict(
+                        image,
+                        ddpm_steps = steps,
+                        fidelity_weight = fidelity,
+                        upscale = 4.0,
+                        seed = seed,
+                        tile_overlap = 32,
+                        colorfix_type = 'adain',
+                        pbar_tooltip = key
+                    )
+
+                    output_image = (output_image + 1.0) / 2.0
+                    output_image = torch.clamp(output_image * 255.0, min=0, max=255.0)
+                    output_image = output_image[0].cpu().numpy().transpose(1, 2, 0)
+                    
+                    save_path = f"/argo/sts/sr-out/references/{key}.png"
+                    Image.fromarray(output_image.astype(np.uint8)).save(save_path)
+
+            
