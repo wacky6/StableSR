@@ -17,6 +17,10 @@ def real_tqdm(*arg, **kwargs):
     return tqdm.tqdm(*arg, **kwargs)
 tqdm.tqdm = _TQDM
 
+import torch
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
+
 import os
 import PIL
 import numpy as np
