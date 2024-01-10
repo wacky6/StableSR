@@ -187,23 +187,23 @@ class Predictor(BasePredictor):
                             sqrt_one_minus_alphas_cumprod=sqrt_one_minus_alphas_cumprod,
                             noise=noise,
                         )
-                        samples, _ = self.model.sample_canvas(
+                        samples = self.model.sample_canvas(
                             cond=semantic_c, 
                             struct_cond=init_latent, 
                             batch_size=im_lq_pch.size(0),
                             timesteps=steps,
                             time_replace=steps,
-                            x_T=x_T, return_intermediates=True,
+                            x_T=x_T, return_intermediates=False,
                             tile_size=int(TILE_SIZE/8),
                             tile_overlap=tile_overlap,
                             batch_size_sample=1,
                         )
-                        _, enc_fea_lq = self.vq_model.encode(im_lq_pch)
-                        x_samples = self.vq_model.decode(samples * 1. / self.model.scale_factor, enc_fea_lq)
+                        _, enc_fea_lq = torch.compile(self.vq_model.encode)(im_lq_pch)
+                        x_samples = torch.compile(self.vq_model.decode)(samples * 1. / self.model.scale_factor, enc_fea_lq)
                         if colorfix_type == 'adain':
-                            x_samples = adaptive_instance_normalization(x_samples, im_lq_pch)
+                            x_samples = torch.compile(adaptive_instance_normalization)(x_samples, im_lq_pch)
                         elif colorfix_type == 'wavelet':
-                            x_samples = wavelet_reconstruction(x_samples, im_lq_pch)
+                            x_samples = torch.compile(wavelet_reconstruction)(x_samples, im_lq_pch)
                         im_spliter.update(x_samples, index_infos)
                         pbar.update()
 
