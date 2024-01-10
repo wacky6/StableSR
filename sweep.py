@@ -291,7 +291,8 @@ if __name__ == '__main__':
 
     for prescale in [1, 4]:
         image = ref_img.resize((w//prescale, h//prescale), resample=PIL.Image.LANCZOS)
-        image = np.array(image).astype(np.float32) / 255.0
+        image = np.array(image).astype(np.float32)
+        image = image / 255.0 * 2.0 - 1.0
         image = image.transpose(2, 0, 1)
         image = torch.from_numpy(image[None])
 
@@ -307,12 +308,11 @@ if __name__ == '__main__':
                         upscale = 4.0,
                         seed = seed,
                         tile_overlap = 32,
-                        colorfix_type = 'adain',
+                        colorfix_type = None,
                         pbar_tooltip = key
                     )
 
-                    output_image = (output_image + 1.0) / 2.0
-                    output_image = torch.clamp(output_image * 255.0, min=0, max=255.0)
+                    output_image = torch.clamp((output_image + 1.0) / 2.0 * 255.0, min=0.0, max=255.0)
                     output_image = output_image[0].cpu().numpy().transpose(1, 2, 0)
                     
                     save_path = f"/argo/sts/sr-out/references/{key}.png"
