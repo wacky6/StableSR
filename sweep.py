@@ -36,6 +36,7 @@ from sane_utils import seed_everything
 import torch.nn.functional as F
 from scripts.util_image import ImageSpliterTh
 import threading
+import math
 
 from ldm.util import instantiate_from_config
 from scripts.wavelet_color_fix import (
@@ -50,6 +51,8 @@ UNET_CONFIG = "configs/stableSRNew/v2-finetune_text_T_768v.yaml"
 UNET_CHECKPOINT = "checkpoints/stablesr_768v_000139.ckpt"
 VQGAN_CHECKPOINT = "checkpoints/vqgan_cfw_00011.ckpt"
 TILE_SIZE = 768    # Model's native size is preferred?
+IMAGE_SIZE_INCREMENT = 32    # Pad (i.e. align) image size to multiples of this value
+SCALE = 4
 
 # WARN: VRAM intensive
 VQGAN_SIZE = 1536     # Size to VRAM: 1024 -> 15GB ; 1536 -> 19GB; 1736 -> 21G; 2048 -> 24G;
@@ -71,10 +74,10 @@ class Predictor(BasePredictor):
         self.vq_model = load_model_from_config(vqgan_config, VQGAN_CHECKPOINT)
         self.vq_model = self.vq_model.to(device)
 
-    # `input_image` and `output_image` are fp32 nchw within range [-1, 1]
+    # `image` and `output_image` are fp32 nchw within range [-1, 1]
     def predict(
         self,
-        input_image: torch.Tensor,
+        image: torch.Tensor,
         ddpm_steps: int = Input(
             description="Number of DDPM steps for sampling", default=200
         ),
@@ -293,18 +296,26 @@ if __name__ == '__main__':
 
     images = sorted(glob("/argo/sts/sr-in/references/*"))
     images = filter(lambda p: os.path.splitext(p)[1].lower() in [".jpg", ".png"], images)
+    images = list(images)[4:]
 
     for ref_img_path in images:
         basename, _ = os.path.splitext(os.path.basename(ref_img_path))
         ref_img = Image.open(ref_img_path).convert("RGB")
         w, h = ref_img.size
 
-        for prescale in [1,2,4]:
+        for prescale in [1, 2]:
             image = ref_img.resize((w//prescale, h//prescale), resample=PIL.Image.LANCZOS)
-            image = np.array(image).astype(np.float32)
-            image = image / 255.0 * 2.0 - 1.0
-            image = image.transpose(2, 0, 1)
-            image = torch.from_numpy(image[None])
+
+            # Pad image so each dimension is a multiple of 32 for the model.
+            pw, ph = map(lambda x: math.ceil((x // prescale) / IMAGE_SIZE_INCREMENT) * IMAGE_SIZE_INCREMENT, (w, h))
+            padded_image = Image.new(image.mode, (pw, ph), (0, 0, 0))
+            padded_image.paste(image, (0,0))
+
+            # Prepare Tensor
+            padded_image = np.array(padded_image).astype(np.float32)
+            padded_image = padded_image / 255.0 * 2.0 - 1.0
+            padded_image = padded_image.transpose(2, 0, 1)
+            padded_image = torch.from_numpy(padded_image[None])
 
             for seed in [42, 174, 0xAEAE]:
                 for fidelity in [0, 0.25, 0.5, 0.75, 1]:
@@ -312,10 +323,10 @@ if __name__ == '__main__':
                         key = f"{basename}__scale{prescale}_seed{seed}_steps{steps}_fidelity{fidelity}"
 
                         output_image = p.predict(
-                            image,
+                            padded_image,
                             ddpm_steps = steps,
                             fidelity_weight = fidelity,
-                            upscale = 4.0,
+                            upscale = SCALE,
                             seed = seed,
                             tile_overlap = 32,
                             colorfix_type = None,
@@ -324,6 +335,7 @@ if __name__ == '__main__':
 
                         output_image = torch.clamp((output_image + 1.0) / 2.0 * 255.0, min=0.0, max=255.0)
                         output_image = output_image[0].cpu().numpy().transpose(1, 2, 0)
+                        output_image = output_image[:(h//prescale*SCALE),:(w//prescale*SCALE),:]
 
                         # Write image in the background.
                         save_path = f"/argo/sts/sr-out/references/{key}.png"
